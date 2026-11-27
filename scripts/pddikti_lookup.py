@@ -1,14 +1,17 @@
 """Batch lookup mahasiswa di PDDikti menggunakan Playwright (headed Chrome).
 
 Mendukung:
-- Filter opsional: filter_jenjang (S1/S2/S3), filter_pt, filter_prodi
-- Fallback cerdas: jika filter_pt + filter_prodi tidak ada yang cocok, fallback ke filter_pt saja
+- Pencarian langsung di /search/mahasiswa/<nama>
+- Deteksi & navigasi pagination SVG asli PDDikti ("1 dari N") hingga halaman ke-2 dst.
+- Filter opsional: target_jenjang (S1/S2/S3), filter_pt, filter_prodi
+- Menunggu hidrasi skeleton ("...") selesai pada halaman detail
 - Incremental save & --resume agar progres aman untuk ratusan nama
 """
 
 import argparse
 import csv
 import json
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -60,8 +63,8 @@ def wait_for_search_results(page, timeout_ms: int = 12000) -> None:
         if page.locator('a[href*="/detail-mahasiswa/"]').count() > 0:
             return
         body = page.inner_text("body")
-        if "Tidak ada hasil pencarian" in body and "Mahasiswa" in body:
-            page.wait_for_timeout(1000)
+        if "Tidak ada hasil pencarian" in body:
+            page.wait_for_timeout(800)
             return
         if "Terjadi Kesalahan" in body:
             page.wait_for_timeout(1000)
@@ -89,6 +92,55 @@ def extract_search_rows(page) -> list[dict]:
                 }
             )
     return rows_data
+
+
+def get_pagination_info(page) -> tuple[int, int]:
+    """Baca indikator pagination 'X dari Y' pada halaman pencarian Mahasiswa."""
+    info = page.evaluate(
+        """() => {
+            for (const b of document.querySelectorAll('button')) {
+                const ptxt = (b.parentElement?.innerText || '').replace(/\\s+/g, ' ').trim();
+                const m = ptxt.match(/(\\d+)\\s+dari\\s+(\\d+)/);
+                if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+            }
+            return [1, 1];
+        }"""
+    )
+    return int(info[0]), int(info[1])
+
+
+def click_next_page(page, prev_first_url: str) -> bool:
+    """Klik tombol Next (SVG) pada widget pagination 'X dari Y' jika aktif."""
+    cur_page, total_pages = get_pagination_info(page)
+    if cur_page >= total_pages:
+        return False
+
+    # Di /search/mahasiswa/, widget pagination berisi 2 tombol [Prev, Next] (atau 4 tombol [First, Prev, Next, Last])
+    pag_btns = []
+    for btn in page.locator("button").all():
+        parent_txt = (btn.locator("xpath=..").inner_text() or "").strip()
+        if re.search(r"\d+\s+dari\s+\d+", " ".join(parent_txt.split())):
+            pag_btns.append(btn)
+
+    if len(pag_btns) < 2:
+        return False
+
+    # Untuk 2 tombol -> index 1 adalah Next; untuk 4 tombol -> index 2 adalah Next
+    next_btn = pag_btns[2] if len(pag_btns) >= 4 else pag_btns[1]
+    if not next_btn.is_enabled():
+        return False
+
+    next_btn.click()
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        new_page, _ = get_pagination_info(page)
+        links = page.locator('a[href*="/detail-mahasiswa/"]')
+        new_first = links.first.get_attribute("href") if links.count() > 0 else ""
+        if new_page > cur_page or (new_first and new_first != prev_first_url):
+            page.wait_for_timeout(400)
+            return True
+        page.wait_for_timeout(300)
+    return False
 
 
 def _match_tokens(value: str, pattern: str) -> bool:
@@ -139,37 +191,43 @@ def search_student(
     target_jenjang: str = "",
     filter_pt: str = "",
     filter_prodi: str = "",
-    max_pages: int = 3,
-    max_details: int = 5,
+    max_pages: int = 5,
+    max_details: int = 20,
 ) -> list[dict]:
-    """Cari satu nama mahasiswa di PDDikti dan ambil detail kandidat yang cocok."""
-    search_url = f"{BASE_URL}/search/{urllib.parse.quote(nama)}"
+    """Cari satu nama mahasiswa di PDDikti (termasuk halaman 2 dst.) dan ambil detail kandidat."""
+    search_url = f"{BASE_URL}/search/mahasiswa/{urllib.parse.quote(nama)}"
     page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
     wait_for_search_results(page)
 
     all_rows = []
     seen_urls = set()
 
-    for _ in range(max_pages):
+    for page_num in range(1, max_pages + 1):
         rows = extract_search_rows(page)
         for r in rows:
             if r["detail_url"] not in seen_urls:
                 seen_urls.add(r["detail_url"])
                 all_rows.append(r)
 
-        # Jika ada filter PT dan sudah ada kandidat PT yang cocok di halaman ini, hentikan pagination
-        if filter_pt and any(_match_tokens(r["perguruan_tinggi"], filter_pt) for r in all_rows):
-            break
-        if not filter_pt and not filter_prodi and len(all_rows) >= max_details:
+        cur_page, total_pages = get_pagination_info(page)
+        if page_num == 1 and total_pages > 1:
+            print(f"   [Pagination] Terdeteksi {total_pages} halaman untuk '{nama}'")
+
+        # Jika ada filter PT dan sudah ada kandidat PT+Prodi yang cocok, boleh berhenti lebih awal
+        if filter_pt and any(
+            _match_tokens(r["perguruan_tinggi"], filter_pt)
+            and _match_tokens(r["program_studi"], filter_prodi)
+            for r in all_rows
+        ):
             break
 
-        next_btn = page.locator('button:has-text(">"), button[aria-label*="next" i]').first
-        if next_btn.count() == 0 or not next_btn.is_enabled():
+        if cur_page >= total_pages or page_num >= max_pages:
             break
-        next_btn.click()
-        page.wait_for_timeout(1600)
 
-    # Prioritas filter: PT + Prodi -> PT saja -> Prodi saja -> Semua (terbatas max_details)
+        prev_first = rows[0]["detail_url"] if rows else ""
+        if not click_next_page(page, prev_first):
+            break
+
     pt_prodi_matches = [
         r
         for r in all_rows
@@ -179,11 +237,9 @@ def search_student(
     if pt_prodi_matches:
         candidates = pt_prodi_matches
     elif filter_pt:
-        pt_matches = [r for r in all_rows if _match_tokens(r["perguruan_tinggi"], filter_pt)]
-        candidates = pt_matches
+        candidates = [r for r in all_rows if _match_tokens(r["perguruan_tinggi"], filter_pt)]
     elif filter_prodi:
-        prodi_matches = [r for r in all_rows if _match_tokens(r["program_studi"], filter_prodi)]
-        candidates = prodi_matches
+        candidates = [r for r in all_rows if _match_tokens(r["program_studi"], filter_prodi)]
     else:
         candidates = all_rows
 
@@ -209,7 +265,7 @@ def search_student(
                 "detail_url": row["detail_url"],
             }
         )
-        time.sleep(0.6)
+        time.sleep(0.5)
 
     if not results:
         note = "TIDAK DITEMUKAN (atau PT/Prodi tidak cocok)" if all_rows else "TIDAK DITEMUKAN"
@@ -238,9 +294,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Batch lookup mahasiswa di PDDikti via Playwright.")
     parser.add_argument("--input", default="input_batch.csv", help="Path file CSV input")
     parser.add_argument("--output", default="output_batch.csv", help="Path file CSV output")
-    parser.add_argument("--delay", type=float, default=1.0, help="Jeda antar pencarian (detik)")
-    parser.add_argument("--max-pages", type=int, default=3, help="Maksimal halaman pagination per nama")
-    parser.add_argument("--max-details", type=int, default=5, help="Maksimal kandidat detail yang dibuka per nama")
+    parser.add_argument("--delay", type=float, default=0.8, help="Jeda antar pencarian (detik)")
+    parser.add_argument("--max-pages", type=int, default=5, help="Maksimal halaman pagination per nama")
+    parser.add_argument("--max-details", type=int, default=20, help="Maksimal kandidat detail yang dibuka per nama")
     parser.add_argument("--resume", action="store_true", help="Lewati nama yang sudah ada di file output")
     args = parser.parse_args()
 
